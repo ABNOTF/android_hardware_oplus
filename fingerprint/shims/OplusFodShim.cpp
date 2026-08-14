@@ -61,11 +61,14 @@ struct ParcelCapture {
 static thread_local ParcelCapture gCapture = {nullptr, {0}, 0};
 
 static void writeFodNode(const char* val) {
-    if (gFodFd < 0) {
+    pthread_mutex_lock(&gMutex);
+    int fd = gFodFd;
+    pthread_mutex_unlock(&gMutex);
+    if (fd < 0) {
         ALOGE("notify_fppress fd not open");
         return;
     }
-    ssize_t ret = pwrite(gFodFd, val, strlen(val), 0);
+    ssize_t ret = pwrite(fd, val, strlen(val), 0);
     ALOGI("notify_fppress <= %s (ret=%zd)", val, ret);
 }
 
@@ -165,33 +168,78 @@ static void* monitorThread(void* /*arg*/) {
     return nullptr;
 }
 
-static void startMonitor() {
-    if (gMonitorRunning) return;
+/*
+ * One-shot attempt to bring up the fp_state monitor. Returns true on
+ * success. On failure, *definitiveDisabled is set when there is no point
+ * retrying (the sensor-type property is set to something else, so this
+ * device simply isn't an optical UDFPS).
+ *
+ * The first boot after a flash is racy: persist.* properties and the
+ * /sys/kernel/oplus_display nodes (created by the display kernel driver)
+ * may not be ready when the HAL process starts. The constructor used to
+ * check once and permanently disable itself; the startup thread retries
+ * instead (see startupThread below).
+ */
+static bool tryStartMonitor(bool* definitiveDisabled) {
+    *definitiveDisabled = false;
 
     std::string sensorType = GetProperty("persist.vendor.fingerprint.sensor_type", "");
-    ALOGI("init: sensor_type=%s", sensorType.c_str());
-
     if (sensorType != "optical") {
-        ALOGI("init: not optical sensor, monitor disabled");
-        return;
+        *definitiveDisabled = !sensorType.empty();
+        ALOGI("startup: sensor_type=%s%s", sensorType.c_str(),
+              sensorType.empty() ? " (empty, keep retrying)" : ", monitor disabled");
+        return false;
     }
     if (access(kFpStateNode, R_OK) != 0) {
-        ALOGE("init: %s not readable — fp_state monitor disabled", kFpStateNode);
-        return;
+        ALOGE("startup: %s not readable yet, retrying", kFpStateNode);
+        return false;
     }
 
+    pthread_mutex_lock(&gMutex);
+    if (gFodFd >= 0) {
+        close(gFodFd);
+        gFodFd = -1;
+    }
     gFodFd = open(kFodNode, O_WRONLY | O_CLOEXEC);
-    ALOGI("init: fp_state readable, notify_fppress fd=%d", gFodFd);
+    pthread_mutex_unlock(&gMutex);
+    if (gFodFd < 0) {
+        ALOGE("startup: open %s failed, retrying", kFodNode);
+        return false;
+    }
+    ALOGI("startup: fp_state readable, notify_fppress fd=%d", gFodFd);
 
     gMonitorRunning = true;
 
     if (pthread_create(&gMonitorThread, nullptr, monitorThread, nullptr) == 0) {
         pthread_setname_np(gMonitorThread, "FodMonitor");
-        ALOGI("startMonitor: monitor thread created");
-    } else {
-        ALOGE("startMonitor: failed to create monitor thread");
-        gMonitorRunning = false;
+        ALOGI("startup: monitor thread created");
+        return true;
     }
+    ALOGE("startup: failed to create monitor thread");
+    gMonitorRunning = false;
+    return false;
+}
+
+/*
+ * Startup thread: retries the bring-up until the persist property and the
+ * kernel display nodes are ready (200ms cadence, 60s budget), then starts
+ * the monitor. This covers the first-boot-after-flash race where
+ * persist.vendor.fingerprint.sensor_type and /sys/kernel/oplus_display/*
+ * appear after the HAL process has already started.
+ */
+static void* startupThread(void* /*arg*/) {
+    constexpr int kMaxTries = 300;  // 200ms * 300 = 60s budget
+    for (int i = 0; i < kMaxTries; ++i) {
+        bool definitive = false;
+        if (tryStartMonitor(&definitive)) return nullptr;
+        if (definitive) {
+            ALOGI("startup: not an optical sensor, giving up");
+            return nullptr;
+        }
+        usleep(200 * 1000);
+    }
+    ALOGE("startup: giving up after %d retries", kMaxTries);
+    return nullptr;
 }
 
 /* ISession incoming-call wrapper (if AIBinder_Class_define hook fires) */
@@ -331,7 +379,16 @@ AIBinder_Class* AIBinder_Class_define(const char* interfaceDescriptor,
 __attribute__((constructor))
 static void init() {
     ALOGI("OplusFodShim: constructor");
-    startMonitor();
+    pthread_t t;
+    if (pthread_create(&t, nullptr, startupThread, nullptr) == 0) {
+        pthread_setname_np(t, "FodStartup");
+        pthread_detach(t);
+        ALOGI("OplusFodShim: startup thread created");
+    } else {
+        ALOGE("OplusFodShim: failed to create startup thread");
+        bool definitive = false;
+        tryStartMonitor(&definitive);
+    }
 }
 
 __attribute__((destructor))
@@ -342,8 +399,10 @@ static void cleanup() {
         pthread_join(gMonitorThread, nullptr);
     }
     setPressed(false);
+    pthread_mutex_lock(&gMutex);
     if (gFodFd >= 0) {
         close(gFodFd);
         gFodFd = -1;
     }
+    pthread_mutex_unlock(&gMutex);
 }
