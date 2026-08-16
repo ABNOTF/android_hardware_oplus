@@ -224,7 +224,7 @@ static bool tryStartMonitor(bool* definitiveDisabled) {
  * Startup thread: retries the bring-up until the persist property and the
  * kernel display nodes are ready (200ms cadence, 60s budget), then starts
  * the monitor. This covers the first-boot-after-flash race where
- * persist.vendor.fingerprint.sensor_type and /sys/kernel/oplus_display/*
+ * persist.vendor.fingerprint.sensor_type and the oplus_display sysfs nodes
  * appear after the HAL process has already started.
  */
 static void* startupThread(void* /*arg*/) {
